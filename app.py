@@ -18,15 +18,17 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(b,dict): raise DomainError("请求体必须是对象")
         return b
     def do_GET(self):
-        p=urlparse(self.path); parts=[x for x in p.path.split("/") if x]
+        p=urlparse(self.path); parts=[x for x in p.path.split("/") if x]; qs=parse_qs(p.query)
         try:
             if p.path in ("/","/index.html"):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==5 and parts[:2]==["api","passages"] and parts[3]=="snapshots":
-                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
+                uid=int(qs.get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
-                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+                uid=int(qs.get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="history":
+                uid=int(qs.get("user_id",[0])[0]); return self._json(200,self.db.work_history(int(parts[2]),uid))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -42,8 +44,11 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/alignments": return self._json(201,{"ok":True,"id":self.db.align_passage(int(b.get("passage_id",0)),int(b.get("witness_id",0)),str(b.get("aligned_text","")),int(b.get("sort_order",0)),int(b.get("user_id",0)))})
             if path=="/api/variants": return self._json(201,{"ok":True,"id":self.db.create_variant(int(b.get("passage_id",0)),int(b.get("witness_id",0)),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
+            if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="confirm": return self._json(200,{"ok":True,"confirmed_at":self.db.confirm_variant(int(parts[2]),int(b.get("user_id",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
-            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3] in ("lock","seal"): return self._json(200,{"ok":True,**self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason","")))})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="handover": return self._json(200,{"ok":True,**self.db.handover_work(int(parts[2]),int(b.get("to_user_id",0)),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="basis": return self._json(200,{"ok":True,**self.db.set_gap_basis(int(parts[2]),b.get("gap_basis",[]),int(b.get("user_id",0)))})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():

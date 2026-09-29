@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +15,8 @@ class DomainError(ValueError):
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
+DEFAULT_GAP_BASIS = ["[缺页]", "[残损]"]
+TOKEN_RE = re.compile(r"^\[[^\[\]]{1,8}\]$")
 
 
 def validate_transcription(text: str) -> str:
@@ -25,15 +29,36 @@ def validate_transcription(text: str) -> str:
     return text
 
 
+def normalize_basis(basis) -> list[str]:
+    if isinstance(basis, str):
+        basis = [b.strip() for b in basis.replace("，", ",").split(",") if b.strip()]
+    if not isinstance(basis, (list, tuple)) or not basis:
+        raise DomainError("封存依据至少包含一个缺口标记")
+    cleaned = []
+    for token in basis:
+        token = str(token).strip()
+        if not TOKEN_RE.match(token):
+            raise DomainError(f"封存依据标记无效：{token}（应为 [缺页] 形式）")
+        if token not in cleaned:
+            cleaned.append(token)
+    if len(cleaned) > 6:
+        raise DomainError("封存依据最多包含 6 个缺口标记")
+    return cleaned
+
+
 class CollationDB:
-    """SQLite-backed textual collation service with optimistic revisions."""
+    """SQLite-backed textual collation service with sealing, handover and optimistic revisions."""
 
     def __init__(self, path: str = "collation.db") -> None:
+        self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        # 所有写事务串行化：并发的转交 / 确认 / 封存提交在事务内复查状态，保证只有一次成功。
+        self._txlock = threading.Lock()
         self._schema()
 
     def close(self) -> None:
@@ -41,6 +66,7 @@ class CollationDB:
 
     @contextmanager
     def transaction(self):
+        self._txlock.acquire()
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             yield
@@ -48,6 +74,8 @@ class CollationDB:
         except Exception:
             self.conn.rollback()
             raise
+        finally:
+            self._txlock.release()
 
     def _schema(self) -> None:
         self.conn.executescript(
@@ -62,6 +90,7 @@ class CollationDB:
               title TEXT NOT NULL,
               description TEXT NOT NULL DEFAULT '',
               owner_id INTEGER NOT NULL REFERENCES users(id),
+              gap_basis TEXT NOT NULL DEFAULT '["[缺页]","[残损]"]',
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS work_access (
@@ -91,7 +120,7 @@ class CollationDB:
               work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
               label TEXT NOT NULL,
               base_text TEXT NOT NULL,
-              status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','locked')),
+              status TEXT NOT NULL DEFAULT 'open',
               revision INTEGER NOT NULL DEFAULT 0,
               updated_by INTEGER NOT NULL REFERENCES users(id),
               updated_at TEXT NOT NULL,
@@ -116,6 +145,10 @@ class CollationDB:
               proposed_text TEXT NOT NULL,
               reason TEXT NOT NULL,
               layer INTEGER NOT NULL DEFAULT 1,
+              status TEXT NOT NULL DEFAULT 'pending',
+              sealed_supplement INTEGER NOT NULL DEFAULT 0,
+              confirmed_by INTEGER REFERENCES users(id),
+              confirmed_at TEXT,
               created_by INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -138,20 +171,90 @@ class CollationDB:
               author_id INTEGER NOT NULL REFERENCES users(id),
               created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS passage_locks (
+            CREATE TABLE IF NOT EXISTS passage_seals (
               passage_id INTEGER PRIMARY KEY REFERENCES passages(id) ON DELETE CASCADE,
-              locked_by INTEGER NOT NULL REFERENCES users(id),
+              sealed_by INTEGER NOT NULL REFERENCES users(id),
               reason TEXT NOT NULL DEFAULT '',
-              locked_at TEXT NOT NULL
+              basis_json TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL,
+              revision_no INTEGER NOT NULL,
+              sealed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS seal_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              passage_id INTEGER NOT NULL,
+              work_id INTEGER NOT NULL,
+              action TEXT NOT NULL CHECK(action IN ('sealed','invalidated')),
+              actor_id INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL DEFAULT '',
+              basis_json TEXT NOT NULL DEFAULT '[]',
+              snapshot_json TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS handover_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+              from_owner INTEGER NOT NULL REFERENCES users(id),
+              to_owner INTEGER NOT NULL REFERENCES users(id),
+              pending_revisions INTEGER NOT NULL,
+              unsealed_passages INTEGER NOT NULL,
+              created_at TEXT NOT NULL
             );
             """
         )
+        self._migrate()
         self.conn.commit()
+
+    def _columns(self, table: str) -> set[str]:
+        return {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self) -> None:
+        if "gap_basis" not in self._columns("works"):
+            self.conn.execute("ALTER TABLE works ADD COLUMN gap_basis TEXT NOT NULL DEFAULT "
+                              "'[\"[缺页]\",\"[残损]\"]'")
+        variant_cols = self._columns("variants")
+        if "status" not in variant_cols:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        if "sealed_supplement" not in variant_cols:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN sealed_supplement INTEGER NOT NULL DEFAULT 0")
+        if "confirmed_by" not in variant_cols:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN confirmed_by INTEGER REFERENCES users(id)")
+        if "confirmed_at" not in variant_cols:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN confirmed_at TEXT")
+        # 兼容旧版 locked 数据：迁移为封存并补留快照。
+        if self._columns("passages"):
+            legacy = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='passage_locks'"
+            ).fetchone()
+            if legacy:
+                for row in self.conn.execute("SELECT * FROM passage_locks").fetchall():
+                    pid = row["passage_id"]
+                    exists = self.conn.execute(
+                        "SELECT 1 FROM passage_seals WHERE passage_id=?", (pid,)
+                    ).fetchone()
+                    passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (pid,)).fetchone()
+                    if passage and not exists:
+                        snapshot = self._collect_passage(passage, DEFAULT_GAP_BASIS)
+                        self.conn.execute(
+                            "INSERT INTO passage_seals(passage_id,sealed_by,reason,basis_json,snapshot_json,"
+                            "revision_no,sealed_at) VALUES(?,?,?,?,?,?,?)",
+                            (pid, row["locked_by"], row["reason"], json.dumps(DEFAULT_GAP_BASIS, ensure_ascii=False),
+                             json.dumps(snapshot, ensure_ascii=False), passage["revision"], row["locked_at"]),
+                        )
+                        self.conn.execute(
+                            "INSERT INTO seal_events(passage_id,work_id,action,actor_id,reason,basis_json,"
+                            "snapshot_json,created_at) VALUES(?,?, 'sealed', ?,?,?,?,?)",
+                            (pid, passage["work_id"], row["locked_by"], row["reason"],
+                             json.dumps(DEFAULT_GAP_BASIS, ensure_ascii=False),
+                             json.dumps(snapshot, ensure_ascii=False), row["locked_at"]),
+                        )
+                self.conn.execute("UPDATE passages SET status='sealed' WHERE status='locked'")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
             return
         owner = self.add_user("项目负责人", "owner")
+        self.add_user("接任负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
@@ -162,6 +265,9 @@ class CollationDB:
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        self.confirm_variant(variant, owner)
+
+    # ---------- 用户 / 作品 / 授权 ----------
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -179,8 +285,9 @@ class CollationDB:
             raise DomainError("作品标题或负责人无效")
         with self.transaction():
             cur = self.conn.execute(
-                "INSERT INTO works(title,description,owner_id,created_at) VALUES(?,?,?,?)",
-                (title.strip(), description.strip(), owner_id, datetime.now().isoformat()),
+                "INSERT INTO works(title,description,owner_id,gap_basis,created_at) VALUES(?,?,?,?,?)",
+                (title.strip(), description.strip(), owner_id,
+                 json.dumps(DEFAULT_GAP_BASIS, ensure_ascii=False), datetime.now().isoformat()),
             )
         return int(cur.lastrowid)
 
@@ -200,7 +307,7 @@ class CollationDB:
     def _require_owner(self, work_id: int, user_id: int) -> None:
         row = self.conn.execute("SELECT 1 FROM works WHERE id=? AND owner_id=?", (work_id, user_id)).fetchone()
         if not row:
-            raise DomainError("只有项目负责人可以执行此操作")
+            raise DomainError("只有现任项目负责人可以执行此操作")
 
     def can_view_work(self, work_id: int, user_id: int) -> bool:
         return bool(self.conn.execute(
@@ -213,8 +320,8 @@ class CollationDB:
 
     def can_edit_witness(self, witness_id: int, user_id: int) -> bool:
         row = self.conn.execute(
-            "SELECT w.work_id,wa.permission FROM witnesses w LEFT JOIN work_access wa ON wa.work_id=w.work_id AND wa.user_id=? WHERE w.id=?",
-            (user_id, witness_id),
+            "SELECT w.work_id FROM witnesses w WHERE w.id=?",
+            (witness_id,),
         ).fetchone()
         if not row:
             return False
@@ -250,6 +357,50 @@ class CollationDB:
                 (witness_id, user_id, granted_by),
             )
 
+    # ---------- 负责人转交 ----------
+
+    def handover_work(self, work_id: int, to_user_id: int, user_id: int) -> dict:
+        """负责人转交作品：未处理修订和封存责任一并移交，原负责人写权限立即收回。"""
+        with self.transaction():
+            work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+            if not work:
+                raise DomainError("作品不存在")
+            if work["owner_id"] != user_id:
+                raise DomainError("只有现任负责人可以转交作品")
+            if to_user_id == user_id:
+                raise DomainError("不能转交给自己")
+            target = self.conn.execute("SELECT * FROM users WHERE id=?", (to_user_id,)).fetchone()
+            if not target or target["role"] != "owner":
+                raise DomainError("接手人权限不符，转交被拒绝：接手人必须具备负责人(owner)身份")
+            pending = int(self.conn.execute(
+                "SELECT COUNT(*) FROM variants v JOIN passages p ON p.id=v.passage_id "
+                "WHERE p.work_id=? AND v.status='pending'", (work_id,),
+            ).fetchone()[0])
+            unsealed = int(self.conn.execute(
+                "SELECT COUNT(*) FROM passages WHERE work_id=? AND status!='sealed'", (work_id,),
+            ).fetchone()[0])
+            now = datetime.now().isoformat()
+            self.conn.execute(
+                "INSERT INTO handover_log(work_id,from_owner,to_owner,pending_revisions,unsealed_passages,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (work_id, user_id, to_user_id, pending, unsealed, now),
+            )
+            self.conn.execute("UPDATE works SET owner_id=? WHERE id=?", (to_user_id, work_id))
+            # 原负责人失去该作品的一切写权限（负责人身份移交、版本编辑授权收回），保留查看权限。
+            self.conn.execute(
+                "DELETE FROM witness_editors WHERE user_id=? AND witness_id IN "
+                "(SELECT id FROM witnesses WHERE work_id=?)",
+                (user_id, work_id),
+            )
+            self.conn.execute(
+                "INSERT INTO work_access(work_id,user_id,permission) VALUES(?,?,'view') "
+                "ON CONFLICT(work_id,user_id) DO UPDATE SET permission='view'",
+                (work_id, user_id),
+            )
+        return {"new_owner_id": to_user_id, "pending_revisions": pending, "unsealed_passages": unsealed}
+
+    # ---------- 段落与对齐 ----------
+
     def add_passage(self, work_id: int, label: str, base_text: str, user_id: int) -> int:
         self._require_owner(work_id, user_id)
         text = validate_transcription(base_text)
@@ -270,6 +421,8 @@ class CollationDB:
         witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
         if not passage or not witness or passage["work_id"] != witness["work_id"]:
             raise DomainError("段落与版本不属于同一作品")
+        if self._is_sealed(passage):
+            raise DomainError("段落已封存锁定，不能改动已交付的对齐内容")
         if not self.can_edit_witness(witness_id, user_id):
             raise DomainError("无权编辑该版本")
         if sort_order <= 0:
@@ -285,23 +438,27 @@ class CollationDB:
                 raise DomainError("该版本已经对齐此段落") from exc
         return int(cur.lastrowid)
 
+    # ---------- 异文 / 修订 / 确认 ----------
+
     def create_variant(self, passage_id: int, witness_id: int, proposed_text: str, reason: str,
                        user_id: int, expected_revision: int) -> int:
         with self.transaction():
-            passage, lock = self._editable_passage(passage_id, witness_id, user_id, expected_revision)
+            passage, sealed = self._passage_context(passage_id, witness_id, user_id, expected_revision, sealed_ok=True)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
                 raise DomainError("取舍理由至少3个字符")
             if not self.conn.execute("SELECT 1 FROM alignments WHERE passage_id=? AND witness_id=?", (passage_id, witness_id)).fetchone():
                 raise DomainError("该版本尚未对齐此段落")
+            now = datetime.now().isoformat()
             cur = self.conn.execute(
-                "INSERT INTO variants(passage_id,witness_id,base_text,proposed_text,reason,created_by,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (passage_id, witness_id, passage["base_text"], text, reason.strip(), user_id, datetime.now().isoformat(), datetime.now().isoformat()),
+                "INSERT INTO variants(passage_id,witness_id,base_text,proposed_text,reason,status,sealed_supplement,"
+                "created_by,created_at,updated_at) VALUES(?,?,?,?,?, 'pending', ?,?,?,?)",
+                (passage_id, witness_id, passage["base_text"], text, reason.strip(),
+                 1 if sealed else 0, user_id, now, now),
             )
             variant_id = int(cur.lastrowid)
             revision = self._record_revision(passage_id, variant_id, 1, user_id)
-            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, datetime.now().isoformat(), passage_id))
+            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, now, passage_id))
         return variant_id
 
     def update_variant(self, variant_id: int, proposed_text: str, reason: str, user_id: int,
@@ -310,31 +467,60 @@ class CollationDB:
             variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
             if not variant:
                 raise DomainError("异文记录不存在")
-            passage, _ = self._editable_passage(variant["passage_id"], variant["witness_id"], user_id, expected_revision)
+            passage, _ = self._passage_context(variant["passage_id"], variant["witness_id"], user_id, expected_revision, sealed_ok=False)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
                 raise DomainError("取舍理由至少3个字符")
             layer = int(self.conn.execute("SELECT COALESCE(MAX(layer),0)+1 FROM variants WHERE passage_id=? AND witness_id=?", (variant["passage_id"], variant["witness_id"])).fetchone()[0])
+            now = datetime.now().isoformat()
+            # 新层一律回到未确认状态，未经确认不能混入交付稿。
             self.conn.execute(
-                "UPDATE variants SET proposed_text=?,reason=?,layer=?,updated_at=? WHERE id=?",
-                (text, reason.strip(), layer, datetime.now().isoformat(), variant_id),
+                "UPDATE variants SET proposed_text=?,reason=?,layer=?,status='pending',confirmed_by=NULL,"
+                "confirmed_at=NULL,updated_at=? WHERE id=?",
+                (text, reason.strip(), layer, now, variant_id),
             )
             revision = self._record_revision(variant["passage_id"], variant_id, layer, user_id)
-            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, datetime.now().isoformat(), variant["passage_id"]))
+            self.conn.execute("UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?", (revision, user_id, now, variant["passage_id"]))
         return revision
 
-    def _editable_passage(self, passage_id: int, witness_id: int, user_id: int, expected_revision: int):
+    def confirm_variant(self, variant_id: int, user_id: int) -> str:
+        """确认修订：pending -> confirmed 只允许一次，并发提交只有第一次成功。"""
+        with self.transaction():
+            variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+            if not variant:
+                raise DomainError("异文记录不存在")
+            passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (variant["passage_id"],)).fetchone()
+            self._require_owner(passage["work_id"], user_id)
+            if variant["status"] == "confirmed":
+                raise DomainError("修订已经确认，重复提交无效")
+            now = datetime.now().isoformat()
+            self.conn.execute(
+                "UPDATE variants SET status='confirmed',confirmed_by=?,confirmed_at=? WHERE id=?",
+                (user_id, now, variant_id),
+            )
+        return now
+
+    def _is_sealed(self, passage: sqlite3.Row) -> bool:
+        if passage["status"] == "sealed":
+            return True
+        return bool(self.conn.execute(
+            "SELECT 1 FROM passage_seals WHERE passage_id=?", (passage["id"],)
+        ).fetchone())
+
+    def _passage_context(self, passage_id: int, witness_id: int, user_id: int, expected_revision: int,
+                         sealed_ok: bool):
         passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
         witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
         if not passage or not witness or passage["work_id"] != witness["work_id"]:
             raise DomainError("段落与版本不属于同一作品")
-        if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage_id,)).fetchone():
-            raise DomainError("段落已锁定，不能修改")
+        sealed = self._is_sealed(passage)
+        if sealed and not sealed_ok:
+            raise DomainError("段落已封存锁定，不能改动已交付内容")
         if not self.can_edit_witness(witness_id, user_id):
             raise DomainError("无权编辑该版本")
         if passage["revision"] != expected_revision:
             raise DomainError(f"版本冲突：当前修订为 {passage['revision']}，提交基于 {expected_revision}")
-        return passage, None
+        return passage, sealed
 
     def _record_revision(self, passage_id: int, variant_id: int, layer: int, user_id: int) -> int:
         revision = int(self.conn.execute("SELECT COALESCE(MAX(revision_no),0)+1 FROM revisions WHERE passage_id=?", (passage_id,)).fetchone()[0])
@@ -367,17 +553,101 @@ class CollationDB:
             )
         return int(cur.lastrowid)
 
-    def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> None:
-        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
-        if not passage:
-            raise DomainError("段落不存在")
-        self._require_owner(passage["work_id"], user_id)
+    # ---------- 封存 / 封存依据 ----------
+
+    def _collect_passage(self, passage: sqlite3.Row, basis: list) -> dict:
+        alignments = []
+        for row in self.conn.execute(
+            "SELECT a.*,w.siglum,w.kind FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
+            "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],),
+        ).fetchall():
+            item = dict(row)
+            item["has_gap"] = any(token in item["aligned_text"] for token in basis)
+            alignments.append(item)
+        variants = []
+        for row in self.conn.execute(
+            "SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)
+        ).fetchall():
+            variant = dict(row)
+            variant["notes"] = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
+            variants.append(variant)
+        return {"passage": dict(passage), "alignments": alignments, "variants": variants, "gap_basis": basis}
+
+    def seal_passage(self, passage_id: int, user_id: int, reason: str = "") -> dict:
+        """封存段落：留存异文、注释和对齐快照。封存后只能补录，不能改动已交付内容。"""
         with self.transaction():
-            self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
+            passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+            if not passage:
+                raise DomainError("段落不存在")
+            self._require_owner(passage["work_id"], user_id)
+            if self._is_sealed(passage):
+                raise DomainError("段落已经封存，不能重复封存")
+            pending = self.conn.execute(
+                "SELECT COUNT(*) FROM variants WHERE passage_id=? AND status!='confirmed'", (passage_id,)
+            ).fetchone()[0]
+            if pending:
+                raise DomainError("仍有未确认修订，确认后才能封存，未确认修订不能混入交付稿")
+            work = self.conn.execute("SELECT gap_basis FROM works WHERE id=?", (passage["work_id"],)).fetchone()
+            basis = json.loads(work["gap_basis"])
+            snapshot = self._collect_passage(passage, basis)
+            now = datetime.now().isoformat()
+            snap_text = json.dumps(snapshot, ensure_ascii=False)
+            basis_text = json.dumps(basis, ensure_ascii=False)
             self.conn.execute(
-                "INSERT OR REPLACE INTO passage_locks(passage_id,locked_by,reason,locked_at) VALUES(?,?,?,?)",
-                (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
+                "INSERT INTO passage_seals(passage_id,sealed_by,reason,basis_json,snapshot_json,revision_no,sealed_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (passage_id, user_id, reason.strip(), basis_text, snap_text, passage["revision"], now),
             )
+            self.conn.execute(
+                "INSERT INTO seal_events(passage_id,work_id,action,actor_id,reason,basis_json,snapshot_json,created_at) "
+                "VALUES(?,?,'sealed',?,?,?,?,?)",
+                (passage_id, passage["work_id"], user_id, reason.strip(), basis_text, snap_text, now),
+            )
+            self.conn.execute(
+                "UPDATE passages SET status='sealed',updated_by=?,updated_at=? WHERE id=?",
+                (user_id, now, passage_id),
+            )
+        return {"passage_id": passage_id, "sealed_at": now, "revision_no": passage["revision"], "gap_basis": basis}
+
+    def lock_passage(self, passage_id: int, user_id: int, reason: str = "") -> dict:
+        # 旧接口保留：锁定即封存。
+        return self.seal_passage(passage_id, user_id, reason)
+
+    def set_gap_basis(self, work_id: int, basis, user_id: int) -> dict:
+        """修改封存依据：旧封存立即失效，缺口统计和导出随后按新依据重算。"""
+        new_basis = normalize_basis(basis)
+        with self.transaction():
+            work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+            if not work:
+                raise DomainError("作品不存在")
+            self._require_owner(work_id, user_id)
+            old_basis = json.loads(work["gap_basis"])
+            if old_basis == new_basis:
+                return {"gap_basis": new_basis, "invalidated_seals": 0}
+            now = datetime.now().isoformat()
+            reason = f"封存依据变更：{'、'.join(old_basis)} → {'、'.join(new_basis)}"
+            sealed_rows = self.conn.execute(
+                "SELECT s.*,p.work_id FROM passage_seals s JOIN passages p ON p.id=s.passage_id "
+                "WHERE p.work_id=?", (work_id,),
+            ).fetchall()
+            for row in sealed_rows:
+                self.conn.execute(
+                    "INSERT INTO seal_events(passage_id,work_id,action,actor_id,reason,basis_json,snapshot_json,created_at) "
+                    "VALUES(?,?,'invalidated',?,?,?,?,?)",
+                    (row["passage_id"], work_id, user_id, reason,
+                     json.dumps(new_basis, ensure_ascii=False), None, now),
+                )
+                self.conn.execute("DELETE FROM passage_seals WHERE passage_id=?", (row["passage_id"],))
+                self.conn.execute(
+                    "UPDATE passages SET status='open',updated_by=?,updated_at=? WHERE id=?",
+                    (user_id, now, row["passage_id"]),
+                )
+            self.conn.execute("UPDATE works SET gap_basis=? WHERE id=?",
+                              (json.dumps(new_basis, ensure_ascii=False), work_id))
+        return {"gap_basis": new_basis, "invalidated_seals": len(sealed_rows)}
+
+    # ---------- 快照 / 历史 / 导出 ----------
 
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
@@ -388,10 +658,17 @@ class CollationDB:
             raise DomainError("快照不存在")
         return {"revision_no": row["revision_no"], "layer": row["layer"], "created_at": row["created_at"], "snapshot": json.loads(row["snapshot_json"])}
 
+    def _variant_notes(self, variant_id: int, note_ids=None) -> list:
+        rows = self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (variant_id,)).fetchall()
+        if note_ids is not None:
+            rows = [r for r in rows if r["id"] in note_ids]
+        return [dict(r) for r in rows]
+
     def export_collation(self, work_id: int, user_id: int) -> dict:
         if not self.can_view_work(work_id, user_id):
             raise DomainError("无权查看该校勘项目")
         work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        basis = json.loads(work["gap_basis"])
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
         passages = []
         gaps = 0
@@ -402,17 +679,98 @@ class CollationDB:
                 "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],)
             ).fetchall():
                 item = dict(row)
-                if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
+                if any(token in item["aligned_text"] for token in basis):
                     item["has_gap"] = True
                     gaps += 1
                 alignments.append(item)
-            variants = []
-            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
-                variant = dict(row)
-                variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
-                variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            all_variants = self.conn.execute(
+                "SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)
+            ).fetchall()
+            seal_row = self.conn.execute(
+                "SELECT * FROM passage_seals WHERE passage_id=?", (passage["id"],)
+            ).fetchone()
+            seal_info = None
+            delivered, pending, supplements = [], [], []
+            if seal_row:
+                sealed_snapshot = json.loads(seal_row["snapshot_json"])
+                sealed_at = seal_row["sealed_at"]
+                delivered_ids = {v["id"] for v in sealed_snapshot["variants"]}
+                extra_notes = []
+                for row in all_variants:
+                    variant = dict(row)
+                    variant["notes"] = self._variant_notes(row["id"])
+                    if row["id"] in delivered_ids:
+                        # 交付稿只保留封存时点（含）之前的注释；封存后补录的注释单独列出，仅供查阅。
+                        later = [n for n in variant["notes"] if n["created_at"] > sealed_at]
+                        variant["notes"] = [n for n in variant["notes"] if n["created_at"] <= sealed_at]
+                        delivered.append(variant)
+                        for note in later:
+                            note["variant_id"] = row["id"]
+                            extra_notes.append(note)
+                    else:
+                        supplements.append(variant)
+                seal_info = {
+                    "sealed_by": seal_row["sealed_by"],
+                    "reason": seal_row["reason"],
+                    "sealed_at": seal_row["sealed_at"],
+                    "revision_no": seal_row["revision_no"],
+                    "gap_basis": json.loads(seal_row["basis_json"]),
+                }
+                pending_block = {"variants": supplements, "notes": extra_notes}
+            else:
+                for row in all_variants:
+                    variant = dict(row)
+                    variant["notes"] = self._variant_notes(row["id"])
+                    (delivered if row["status"] == "confirmed" else pending).append(variant)
+                pending_block = {"variants": pending, "notes": []}
+            passages.append({
+                **dict(passage),
+                "alignments": alignments,
+                "variants": delivered,
+                "pending_variants": [] if seal_row else pending,
+                "supplements": pending_block,
+                "seal": seal_info,
+            })
+        return {
+            "work": dict(work),
+            "gap_basis": basis,
+            "witnesses": witnesses,
+            "passages": passages,
+            "gap_count": gaps,
+        }
+
+    def work_history(self, work_id: int, user_id: int) -> dict:
+        if not self.conn.execute("SELECT 1 FROM works WHERE id=?", (work_id,)).fetchone():
+            raise DomainError("作品不存在")
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该项目历史")
+        handovers = [dict(r) for r in self.conn.execute(
+            "SELECT h.*,f.name AS from_name,t.name AS to_name FROM handover_log h "
+            "JOIN users f ON f.id=h.from_owner JOIN users t ON t.id=h.to_owner "
+            "WHERE h.work_id=? ORDER BY h.id", (work_id,),
+        ).fetchall()]
+        seals = []
+        for row in self.conn.execute(
+            "SELECT e.id,e.passage_id,e.action,e.actor_id,e.reason,e.basis_json,e.snapshot_json,e.created_at,"
+            "p.label,u.name AS actor_name FROM seal_events e "
+            "JOIN passages p ON p.id=e.passage_id JOIN users u ON u.id=e.actor_id "
+            "WHERE e.work_id=? ORDER BY e.id", (work_id,),
+        ).fetchall():
+            item = {k: row[k] for k in row.keys() if k != "snapshot_json"}
+            item["basis"] = json.loads(row["basis_json"])
+            item["snapshot"] = json.loads(row["snapshot_json"]) if row["snapshot_json"] else None
+            seals.append(item)
+        revisions = [dict(r) for r in self.conn.execute(
+            "SELECT r.revision_no,r.passage_id,r.variant_id,r.layer,r.author_id,r.created_at,u.name AS author_name,p.label "
+            "FROM revisions r JOIN users u ON u.id=r.author_id JOIN passages p ON p.id=r.passage_id "
+            "WHERE p.work_id=? ORDER BY r.id", (work_id,),
+        ).fetchall()]
+        confirmations = [dict(r) for r in self.conn.execute(
+            "SELECT v.id,v.passage_id,p.label,v.status,v.confirmed_by,v.confirmed_at,u.name AS confirmer_name "
+            "FROM variants v JOIN passages p ON p.id=v.passage_id "
+            "LEFT JOIN users u ON u.id=v.confirmed_by WHERE p.work_id=? ORDER BY v.id", (work_id,),
+        ).fetchall()]
+        return {"handovers": handovers, "seals": seals, "revisions": revisions, "confirmations": confirmations}
 
     def snapshot(self) -> dict:
         return {
@@ -420,4 +778,7 @@ class CollationDB:
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "variants": [dict(r) for r in self.conn.execute("SELECT * FROM variants ORDER BY id")],
+            "seals": [dict(r) for r in self.conn.execute("SELECT * FROM passage_seals ORDER BY passage_id")],
+            "handovers": [dict(r) for r in self.conn.execute("SELECT * FROM handover_log ORDER BY id")],
         }

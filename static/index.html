@@ -1,1 +1,204 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字人文文本校勘</title><style>body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px;background:#f7f5ef}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #d6d0c4;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #aaa;border-radius:6px}button{background:#5b3d22;color:#fff}pre{white-space:pre-wrap;max-height:400px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}</style><h1>数字人文文本校勘</h1><section><button onclick="state()">刷新状态</button><pre id="state"></pre></section><section><h2>段落与版本对齐</h2><div class="grid"><input id="work" type="number" placeholder="作品 ID"><input id="passage" type="number" placeholder="段落 ID"><input id="witness" type="number" placeholder="版本 ID"><input id="user" type="number" placeholder="用户 ID"><input id="order" type="number" value="1"><textarea id="text" placeholder="对齐文本">春水东流，[缺页]</textarea></div><button onclick="align()">保存对齐</button><pre id="result"></pre></section><section><h2>异文多层修订</h2><input id="variant" type="number" placeholder="异文 ID"><input id="revision" type="number" value="0" placeholder="当前修订"><input id="reason" placeholder="取舍理由"><textarea id="proposed" placeholder="拟订文本"></textarea><button onclick="variant()">新增异文</button><button onclick="revise()">提交新层</button><button onclick="snapshot()">查看快照</button><button onclick="lock()">锁定段落</button><pre id="extra"></pre></section><script>const show=(e,x)=>document.querySelector(e).textContent=JSON.stringify(x,null,2);async function get(u,e='#result'){show(e,await(await fetch(u)).json())}async function post(u,b,e='#result'){show(e,await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function state(){show('#state',await(await fetch('/api/state')).json())}function align(){post('/api/alignments',{passage_id:+passage.value,witness_id:+witness.value,aligned_text:text.value,sort_order:+order.value,user_id:+user.value})}function variant(){post('/api/variants',{passage_id:+passage.value,witness_id:+witness.value,proposed_text:proposed.value,reason:reason.value,user_id:+user.value,expected_revision:+revision.value})}function revise(){post('/api/variants/'+variant.value+'/revisions',{proposed_text:proposed.value,reason:reason.value,user_id:+user.value,expected_revision:+revision.value},'#extra')}function snapshot(){get('/api/passages/'+passage.value+'/snapshots/'+revision.value+'?user_id='+user.value,'#extra')}function lock(){post('/api/passages/'+passage.value+'/lock',{user_id:+user.value,reason:'版本已定稿'},'#extra')}state()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>校勘台 · 封存与授权移交</title>
+<style>
+  body{font:15px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1180px;margin:0 auto 60px;padding:0 16px;background:#f7f5ef;color:#2a241d}
+  h1{margin:22px 0 4px} .sub{color:#7a6f5e;margin:0 0 16px}
+  section{background:#fff;padding:16px 18px;margin:12px 0;border:1px solid #d6d0c4;border-radius:10px}
+  section h2{margin:0 0 10px;font-size:17px;color:#5b3d22}
+  input,textarea,select{padding:7px;margin:3px 4px 3px 0;border:1px solid #b8ad9c;border-radius:6px;font:inherit;background:#fff;box-sizing:border-box}
+  input[type=number]{width:88px} input[type=text]{min-width:150px} textarea{width:100%;min-height:54px}
+  button{padding:7px 14px;margin:4px 6px 4px 0;border:none;border-radius:6px;background:#5b3d22;color:#fff;cursor:pointer;font:inherit}
+  button:hover{background:#7a5230} button.ghost{background:#fff;color:#5b3d22;border:1px solid #5b3d22}
+  button.danger{background:#8c3a2e} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:4px 10px;margin-bottom:6px}
+  .grid label{font-size:12px;color:#8a7f6b;display:flex;flex-direction:column}
+  pre{background:#26211a;color:#e8e0d2;padding:12px;border-radius:8px;white-space:pre-wrap;max-height:380px;overflow:auto;font-size:13px}
+  .ok{color:#2e6b34;font-weight:600}.err{color:#8c3a2e;font-weight:600}
+  table{border-collapse:collapse;width:100%;font-size:13px} td,th{border:1px solid #ddd5c6;padding:5px 8px;text-align:left;vertical-align:top}
+  th{background:#f0ebe0}.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:4px}
+  .tag.sealed{background:#e3ecdd;color:#2e6b34}.tag.open{background:#f4e7d2;color:#8a5a1a}
+  .tag.pending{background:#f7ded9;color:#8c3a2e}.tag.confirmed{background:#dde6f0;color:#2c4a78}
+  .hint{color:#8a7f6b;font-size:13px;margin:4px 0}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+  .card{border:1px solid #d6d0c4;border-radius:8px;padding:10px 12px;background:#fdfcf9}
+  .card h3{margin:2px 0 6px;font-size:15px}.kv{font-size:13px;color:#5d5446;margin:2px 0}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+</style>
+<h1>校勘台 · 封存与授权移交闭环</h1>
+<p class="sub">段落封存留快照 · 封存后只补不改 · 负责人转交带未处理修订与封存责任 · 修订确认仅一次生效 · 依据变更旧封存立即失效</p>
+
+<section>
+  <h2>当前身份与作品</h2>
+  <div class="grid">
+    <label>当前用户 ID<input id="user" type="number" value="1"></label>
+    <label>作品 ID<input id="work" type="number" value="1"></label>
+    <label>段落 ID<input id="passage" type="number" value="1"></label>
+    <label>版本 ID<input id="witness" type="number" value="2"></label>
+    <label>异文 ID<input id="variant" type="number" value="1"></label>
+    <label>基于修订号<input id="revision" type="number" value="0"></label>
+    <label>排序号<input id="order" type="number" value="3"></label>
+    <label>接手人 ID<input id="newowner" type="number" value="2"></label>
+  </div>
+  <button onclick="refresh()">刷新总览</button>
+  <button class="ghost" onclick="loadCollation()">查看交付稿</button>
+  <button class="ghost" onclick="loadHistory()">查阅历史</button>
+  <div id="overview"></div>
+</section>
+
+<section>
+  <h2>① 对齐与异文（封存后禁止改动已交付内容）</h2>
+  <textarea id="text" placeholder="对齐 / 拟订文本">春水东流，[缺页]</textarea>
+  <input id="reason" type="text" placeholder="取舍理由（≥3字）" style="min-width:260px">
+  <div class="hint">标记须成对使用方括号，如 <span class="mono">[缺页] [不可辨] [残损] [插入] [删除]</span>。</div>
+  <button onclick="align()">保存对齐</button>
+  <button onclick="addVariant()">新增异文 / 封存后补录</button>
+  <button onclick="revise()">提交新层</button>
+</section>
+
+<section>
+  <h2>② 确认与封存</h2>
+  <div class="hint">未确认（pending）修订不能封存、不会进入交付稿；确认只能成功一次，并发提交由后端裁决。</div>
+  <button onclick="confirmVariant()">确认异文</button>
+  <button onclick="seal()">封存段落</button>
+  <input id="sealreason" type="text" placeholder="封存依据说明，如：定稿" style="min-width:220px">
+  <button class="ghost" onclick="snapshot()">查看修订快照</button>
+  <button onclick="addNote()">补录注释</button>
+  <textarea id="note" placeholder="注释正文（封存后仍可补录，单独存放不混入交付稿）"></textarea>
+</section>
+
+<section>
+  <h2>③ 负责人转交</h2>
+  <div class="hint">接手人必须是 owner 身份；转交时未处理修订数、未封存段落数一并登记，原负责人立即失去写权限（保留查看）。并发转交只成功一次。</div>
+  <button class="danger" onclick="handover()">转交给新负责人</button>
+</section>
+
+<section>
+  <h2>④ 封存依据（缺口标记）</h2>
+  <div class="hint">修改依据后，该作品全部旧封存立即失效、段落回到未封存；缺口统计与交付稿导出按新依据重算。</div>
+  <input id="basis" type="text" placeholder='逗号分隔，如：[缺页],[残损]' value="[缺页],[残损]" style="min-width:260px">
+  <button onclick="setBasis()">修改封存依据</button>
+</section>
+
+<section>
+  <h2>结果</h2>
+  <div id="msg" class="hint"></div>
+  <pre id="result">点击「刷新总览」开始。</pre>
+</section>
+
+<section>
+  <h2>历史（转交记录 · 封存事件 · 修订层 · 确认记录）</h2>
+  <div id="history"></div>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+function show(x,el='result'){$(el).textContent=typeof x==='string'?x:JSON.stringify(x,null,2)}
+function flash(ok,txt){const m=$('msg');m.textContent=txt;m.className=ok?'ok':'err'}
+async function api(method,url,body){
+  const opt={method,headers:{'Content-Type':'application/json'}};
+  if(body!==undefined)opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt),j=await r.json();
+  if(j.ok===false)throw new Error(j.error||'操作失败');
+  return j;
+}
+async function run(fn){try{const j=await fn();flash(true,'操作成功');show(j);await refresh()}catch(e){flash(false,'失败：'+e.message)}}
+
+const val=id=>+$(id).value;
+
+function align(){run(()=>api('POST','/api/alignments',{passage_id:val('passage'),witness_id:val('witness'),aligned_text:$('text').value,sort_order:val('order'),user_id:val('user')}))}
+function addVariant(){run(()=>api('POST','/api/variants',{passage_id:val('passage'),witness_id:val('witness'),proposed_text:$('text').value,reason:$('reason').value,user_id:val('user'),expected_revision:val('revision')}))}
+function revise(){run(()=>api('POST','/api/variants/'+val('variant')+'/revisions',{proposed_text:$('text').value,reason:$('reason').value,user_id:val('user'),expected_revision:val('revision')}))}
+function confirmVariant(){run(()=>api('POST','/api/variants/'+val('variant')+'/confirm',{user_id:val('user')}))}
+function seal(){run(()=>api('POST','/api/passages/'+val('passage')+'/seal',{user_id:val('user'),reason:$('sealreason').value}))}
+function addNote(){run(()=>api('POST','/api/notes',{variant_id:val('variant'),body:$('note').value,user_id:val('user')}))}
+function handover(){
+  if(!confirm('确认把作品 '+val('work')+' 转交给用户 '+val('newowner')+'？原负责人将立即失去写权限。'))return;
+  run(()=>api('POST','/api/works/'+val('work')+'/handover',{user_id:val('user'),to_user_id:val('newowner')}));
+}
+function setBasis(){
+  const tokens=$('basis').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean);
+  run(()=>api('POST','/api/works/'+val('work')+'/basis',{user_id:val('user'),gap_basis:tokens}));
+}
+async function snapshot(){
+  try{show(await(await fetch('/api/passages/'+val('passage')+'/snapshots/'+val('revision')+'?user_id='+val('user'))).json())}
+  catch(e){flash(false,e.message)}
+}
+
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+
+async function refresh(){
+  const st=await(await fetch('/api/state')).json();
+  const users=Object.fromEntries(st.users.map(u=>[u.id,u.name]));
+  const works=st.works.map(w=>`
+    <div class="card"><h3>#${w.id} ${esc(w.title)}</h3>
+      <div class="kv">现任负责人：<b>${esc(users[w.owner_id])}</b>（#${w.owner_id}）</div>
+      <div class="kv">缺口依据：${(JSON.parse(w.gap_basis)||[]).map(esc).join('、')}</div>
+    </div>`).join('');
+  const seals=Object.fromEntries((st.seals||[]).map(s=>[s.passage_id,s]));
+  const passages=st.passages.map(p=>{
+    const seal=seals[p.id];
+    const pv=(st.variants||[]).filter(v=>v.passage_id===p.id);
+    const pend=pv.filter(v=>v.status!=='confirmed').length;
+    return `<div class="card">
+      <h3>段落 #${p.id} ${esc(p.label)}
+        <span class="tag ${seal?'sealed':'open'}">${seal?'已封存':'未封存'}</span></h3>
+      <div class="kv">修订层：${p.revision} · 异文：${pv.length} ·
+        <span class="${pend?'err':''}">未确认 ${pend}</span></div>
+      ${seal?`<div class="kv">封存人：${esc(users[seal.sealed_by])} · ${esc(seal.sealed_at)} · 理由：${esc(seal.reason)}</div>`:''}
+    </div>`;
+  }).join('');
+  $('overview').innerHTML=`<div class="cards">${works}</div>
+    <h3 style="margin:14px 0 6px">段落与封存</h3><div class="cards">${passages}</div>
+    <h3 style="margin:14px 0 6px">用户</h3><div>${st.users.map(u=>`<span class="tag ${u.role==='owner'?'confirmed':'open'}">#${u.id} ${esc(u.name)} · ${u.role}</span>`).join('')}</div>`;
+}
+
+async function loadCollation(){
+  try{
+    const d=await (await fetch('/api/works/'+val('work')+'/collation?user_id='+val('user'))).json();
+    if(d.ok===false)throw new Error(d.error);
+    let html=`<p class="hint">《${esc(d.work.title)}》· 负责人 #${d.work.owner_id} · 缺口依据：${d.gap_basis.map(esc).join('、')} · 缺口合计：<b>${d.gap_count}</b></p>`;
+    html+='<table><tr><th>段落</th><th>状态/封存</th><th>对齐（缺口）</th><th>交付稿异文</th><th>未确认/补录</th></tr>';
+    for(const p of d.passages){
+      const al=p.alignments.map(a=>`${esc(a.siglum)}: ${esc(a.aligned_text)}${a.has_gap?' <span class="tag pending">缺口</span>':''}`).join('<br>');
+      const dl=p.variants.map(v=>`#${v.id} ${esc(v.proposed_text)} <span class="tag confirmed">${v.status}</span><br><span class="kv">注释 ${v.notes.length} 条</span>`).join('<hr style="margin:4px 0">')||'<span class="hint">无</span>';
+      const pend=(p.pending_variants||[]).map(v=>`#${v.id} ${esc(v.proposed_text)} <span class="tag pending">待确认</span>`);
+      const sup=(p.supplements&&p.supplements.variants||[]).map(v=>`#${v.id} ${esc(v.proposed_text)} <span class="tag pending">封存后补录</span>`);
+      const sn=(p.supplements&&p.supplements.notes||[]).map(n=>`补注#${n.id}: ${esc(n.body)}`);
+      const other=[...pend,...sup,...sn].join('<br>')||'<span class="hint">无</span>';
+      html+=`<tr><td><b>#${p.id} ${esc(p.label)}</b></td>
+        <td>${p.seal?`<span class="tag sealed">已封存</span><div class="kv">${esc(p.seal.sealed_at)}<br>依据：${p.seal.gap_basis.map(esc).join('、')}</div>`:'<span class="tag open">未封存</span>'}</td>
+        <td>${al}</td><td>${dl}</td><td>${other}</td></tr>`;
+    }
+    $('msg').innerHTML=html;
+    $('msg').className='hint';
+    show('交付稿 JSON 见此；结构化表格见上方。');
+    show(d);
+    flash(true,'交付稿已加载（结构化表格在“结果”上方）');
+  }catch(e){flash(false,'失败：'+e.message)}
+}
+
+async function loadHistory(){
+  try{
+    const d=await (await fetch('/api/works/'+val('work')+'/history?user_id='+val('user'))).json();
+    if(d.ok===false)throw new Error(d.error);
+    const ho=d.handovers.map(h=>`<tr><td>${esc(h.created_at)}</td><td>${esc(h.from_name)} (#${h.from_owner})</td><td>${esc(h.to_name)} (#${h.to_owner})</td><td>${h.pending_revisions}</td><td>${h.unsealed_passages}</td></tr>`).join('')||'<tr><td colspan=5 class="hint">暂无转交</td></tr>';
+    const se=d.seals.map(e=>`<tr><td>${esc(e.created_at)}</td><td>#${e.passage_id} ${esc(e.label)}</td><td><span class="tag ${e.action==='sealed'?'sealed':'pending'}">${e.action==='sealed'?'封存':'失效'}</span></td><td>${esc(e.actor_name)}</td><td>${esc(e.reason)}</td><td>${(e.basis||[]).map(esc).join('、')}</td><td>${e.snapshot?'<span class="tag confirmed">快照已留存</span>':'—'}</td></tr>`).join('')||'<tr><td colspan=7 class="hint">暂无封存事件</td></tr>';
+    const rv=d.revisions.map(r=>`<tr><td>${esc(r.created_at)}</td><td>#${r.passage_id} ${esc(r.label)}</td><td>#${r.variant_id}</td><td>修订号 ${r.revision_no} / 层 ${r.layer}</td><td>${esc(r.author_name)}</td></tr>`).join('')||'<tr><td colspan=5 class="hint">暂无修订</td></tr>';
+    const cf=d.confirmations.map(c=>`<tr><td>#${c.id}（段落 #${c.passage_id} ${esc(c.label)}）</td><td><span class="tag ${c.status==='confirmed'?'confirmed':'pending'}">${c.status}</span></td><td>${esc(c.confirmer_name||'—')}</td><td>${esc(c.confirmed_at||'—')}</td></tr>`).join('');
+    $('history').innerHTML=`
+      <h3>转交记录（含未处理修订与未封存段落数）</h3>
+      <table><tr><th>时间</th><th>原负责人</th><th>接手人</th><th>未处理修订</th><th>未封存段落</th></tr>${ho}</table>
+      <h3>封存 / 失效事件</h3>
+      <table><tr><th>时间</th><th>段落</th><th>动作</th><th>操作人</th><th>说明</th><th>依据</th><th>快照</th></tr>${se}</table>
+      <h3>修订层</h3>
+      <table><tr><th>时间</th><th>段落</th><th>异文</th><th>层号</th><th>作者</th></tr>${rv}</table>
+      <h3>确认记录</h3>
+      <table><tr><th>异文</th><th>状态</th><th>确认人</th><th>确认时间</th></tr>${cf}</table>`;
+    show('历史已加载到页面下方。');
+  }catch(e){flash(false,'失败：'+e.message)}
+}
+
+refresh().catch(()=>{});
+</script>
+</html>
