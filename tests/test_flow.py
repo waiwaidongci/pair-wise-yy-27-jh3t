@@ -20,6 +20,9 @@ class CollationFlowTest(unittest.TestCase):
         self.assertEqual(2,rev)
         snap=self.db.get_snapshot(self.passage,2,self.owner)
         self.assertEqual(2,snap["layer"])
+        # 未确认修订不进入交付稿；确认后才进入
+        self.assertEqual(0,len(self.db.export_collation(self.work,self.reviewer)["passages"][0]["variants"]))
+        self.db.confirm_revision(variant,2,self.owner,"flow-confirm")
         exported=self.db.export_collation(self.work,self.reviewer)
         self.assertEqual(1,exported["gap_count"])
         self.assertTrue(exported["passages"][0]["variants"][0]["notes"] == [])

@@ -27,6 +27,12 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="seals":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"seals":self.db.list_seals(int(parts[2]),uid)})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="handovers":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"handovers":self.db.list_handovers(int(parts[2]),uid)})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="history":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,{"ok":True,"history":self.db.passage_history(int(parts[2]),uid)})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -44,6 +50,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="seal": return self._json(200,{"ok":True,"seal":self.db.seal_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason","")))})
+            if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="basis": self.db.update_passage_basis(int(parts[2]),str(b.get("base_text","")),int(b.get("user_id",0))); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="handovers": return self._json(200,{"ok":True,"handover":self.db.handover_work(int(parts[2]),int(b.get("from_user_id",0)),int(b.get("to_user_id",0)),str(b.get("idempotency_key","")))})
+            if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="confirm": return self._json(200,{"ok":True,"confirm":self.db.confirm_revision(int(parts[2]),int(b.get("revision_no",0)),int(b.get("user_id",0)),str(b.get("idempotency_key","")))})
+            if path=="/api/alignments/update": self.db.update_alignment(int(b.get("passage_id",0)),int(b.get("witness_id",0)),str(b.get("aligned_text","")),int(b.get("sort_order",0)),int(b.get("user_id",0))); return self._json(200,{"ok":True})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():
